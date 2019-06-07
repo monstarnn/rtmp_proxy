@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"github.com/Sirupsen/logrus"
@@ -62,7 +63,7 @@ type ChannelRTMP struct {
 	comment              string
 }
 
-func passThrough(c *Channel) {
+func passThrough(c *Channel, process ...func([]byte) (bool, []byte, error)) {
 	fromPeer := printableAddr(c.from.LocalAddr())
 	toPeer := printableAddr(c.to.LocalAddr())
 
@@ -78,13 +79,30 @@ func passThrough(c *Channel) {
 			break
 		}
 		if n > 0 {
-			// Если что-то пришло, то логируем и пересылаем на выход.
 			c.logger <- []byte(fmt.Sprintf("Received (#%d, %08X) %d bytes from %s\n",
 				packetN, offset, n, fromPeer))
-			// Это все, что нужно для преобразования в hex-дамп. Удобно, не так ли?
-			c.logger <- []byte(hex.Dump(b[:n]))
+			data := b[:n]
+			c.logger <- []byte(hex.Dump(data))
+			if len(process) > 0 {
+				var changed bool
+				for _, p := range process {
+					ch, chData, chErr := p(data)
+					if chErr != nil {
+						c.logger <- []byte(fmt.Sprintf("Process data error: %s\n", chErr.Error()))
+						break
+					}
+					if ch {
+						data = chData
+						changed = true
+					}
+				}
+				if changed {
+					c.logger <- []byte(fmt.Sprintf("Changes (processed) data\n"))
+					c.logger <- []byte(hex.Dump(data))
+				}
+			}
 			c.binaryLogger <- b[:n]
-			c.to.Write(b[:n])
+			c.to.Write(data)
 			c.logger <- []byte(fmt.Sprintf("Sent (#%d) to %s\n", packetN, toPeer))
 			offset += n
 			packetN += 1
@@ -111,14 +129,14 @@ func passThroughRTMP(c *ChannelRTMP) {
 	//	c.ack <- true
 	//}()
 
-	logrus.Println("!!!!!! c.to.Streams", c.comment)
-	if streams, err := c.to.Streams(); err != nil {
-		logrus.Errorf("to.Streams %s error: %v", c.comment, err)
-		return
-	} else {
-		logrus.Println(streams)
-	}
-
+	//logrus.Println("!!!!!! c.to.Streams", c.comment)
+	//if streams, err := c.to.Streams(); err != nil {
+	//	logrus.Errorf("to.Streams %s error: %v", c.comment, err)
+	//	return
+	//} else {
+	//	logrus.Println(streams)
+	//}
+	//
 	logrus.Println("!!!!!! c.from.Streams", c.comment)
 	if streams, err := c.from.Streams(); err != nil {
 		logrus.Errorf("from.Streams %s error: %v", c.comment, err)
@@ -127,11 +145,18 @@ func passThroughRTMP(c *ChannelRTMP) {
 		logrus.Println(streams)
 	}
 
-	if packet, err := c.from.ReadPacket(); err != nil {
-		logrus.Errorf("from.ReadPacket %s error: %v", c.comment, err)
-		return
-	} else {
-		logrus.Println(packet)
+	//if err := c.from.Prepare(); err != nil {
+	//	logrus.Errorf("from.Prepare %s error: %v", c.comment, err)
+	//	return
+	//}
+
+	for {
+		if packet, err := c.from.ReadPacket(); err != nil {
+			logrus.Errorf("from.ReadPacket %s error: %v", c.comment, err)
+			return
+		} else {
+			logrus.Println("!!!! packet", packet)
+		}
 	}
 
 	//for {
@@ -155,7 +180,30 @@ func passThroughRTMP(c *ChannelRTMP) {
 	//}
 }
 
-func processConnection(local net.Conn, connN int, target string) {
+func processPacket(b []byte) (changed bool, ret []byte, err error) {
+
+	var tcUrlIndex int
+	if tcUrlIndex = bytes.Index(b, []byte("tcUrl")); tcUrlIndex == -1 {
+		tcUrlIndex = bytes.Index(b, []byte("tcurl"))
+	}
+	if tcUrlIndex == -1 {
+		return
+	}
+
+	tcUrlIndex += 8
+	var tcUrlBytes = b[tcUrlIndex:]
+	if i := bytes.Index(tcUrlBytes, []byte{byte(0)}); i != -1 {
+		tcUrlBytes = tcUrlBytes[:i]
+	}
+	tcUrl := string(tcUrlBytes)
+
+	logrus.Println("tcUrl: ", tcUrl)
+
+	return
+
+}
+
+func processRawConnection(local net.Conn, connN int, target string) {
 
 	remote, err := net.Dial("tcp", target)
 	if err != nil {
@@ -182,17 +230,17 @@ func processConnection(local net.Conn, connN int, target string) {
 		formatTime(started)))
 
 	go passThrough(&Channel{
-		remote,
-		local,
-		logger,
-		loggerTo,
-		ack,
-	})
-	go passThrough(&Channel{
 		local,
 		remote,
 		logger,
 		loggerFrom,
+		ack,
+	}, processPacket)
+	go passThrough(&Channel{
+		remote,
+		local,
+		logger,
+		loggerTo,
 		ack,
 	})
 
@@ -242,16 +290,6 @@ func processConnectionRTMP(localConn net.Conn, connN int, target, targetURI stri
 		formatTime(started)))
 
 	go passThroughRTMP(&ChannelRTMP{
-		remote,
-		local,
-		remoteURI,
-		localURI,
-		logger,
-		loggerTo,
-		ack,
-		"remote->local",
-	})
-	go passThroughRTMP(&ChannelRTMP{
 		local,
 		remote,
 		localURI,
@@ -260,6 +298,13 @@ func processConnectionRTMP(localConn net.Conn, connN int, target, targetURI stri
 		loggerFrom,
 		ack,
 		"local->remote",
+	})
+	go passThrough(&Channel{
+		remote.NetConn(),
+		local.NetConn(),
+		logger,
+		loggerTo,
+		ack,
 	})
 
 	<-ack
@@ -293,7 +338,11 @@ func main() {
 		if conn, err := ln.Accept(); err == nil {
 			lnn := ln.(*net.TCPListener)
 			logrus.Infof("Accepted addr: %s, network: %s", lnn.Addr().String(), lnn.Addr().Network())
-			go processConnectionRTMP(conn, conn_n, target, targetURI)
+			if false {
+				go processConnectionRTMP(conn, conn_n, target, targetURI)
+			} else {
+				go processRawConnection(conn, conn_n, target)
+			}
 			conn_n += 1
 		} else {
 			logrus.Errorf("Accept failed, %v\n", err)

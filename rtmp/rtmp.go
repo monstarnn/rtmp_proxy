@@ -8,13 +8,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/nareix/joy4/av"
 	"io"
 	"net"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/nareix/joy4/av"
+	//"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/format/flv"
 	"github.com/nareix/joy4/format/flv/flvio"
 	"github.com/nareix/joy4/utils/bits/pio"
@@ -262,11 +263,9 @@ func (x *Conn) pollCommand() (err error) {
 
 func (x *Conn) pollAVTag() (tag flvio.Tag, err error) {
 	for {
-		print("!!! pollAVTag ", x.URL.String(), "\n")
 		if err = x.pollMsg(); err != nil {
 			return
 		}
-		print("!!! pollAVTag msgtypeid ", x.msgtypeid, " ", x.URL.String(), "\n")
 		switch x.msgtypeid {
 		case msgtypeidVideoMsg, msgtypeidAudioMsg:
 			tag = x.avtag
@@ -815,16 +814,10 @@ func (x *Conn) prepare(stage int, flags int) (err error) {
 			}
 
 		case stageCommandDone:
-			print("??1\n")
 			if flags == prepareReading {
-				print("??2\n")
 				if err = x.probe(); err != nil {
-					print("??4\n")
-
 					return
 				}
-				print("??3\n")
-
 			} else {
 				err = fmt.Errorf("rtmp: call WriteHeader() before WritePacket()")
 				return
