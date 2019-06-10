@@ -195,8 +195,10 @@ func (r replacer) searchAndReplace(search []byte, stepAfterSearch int, stop, rep
 
 	searchIndex += len(search) + stepAfterSearch
 	f := r[searchIndex:]
-	if foundEnd := bytes.Index(f, stop); foundEnd != -1 {
-		f = f[:foundEnd]
+	if stop != nil {
+		if foundEnd := bytes.Index(f, stop); foundEnd != -1 {
+			f = f[:foundEnd]
+		}
 	}
 
 	found = make([]byte, len(f))
@@ -229,11 +231,11 @@ func (r replacer) trimLeadZeros() (trimmed bool, result []byte) {
 	return
 }
 
-func (r replacer) setSize() {
+func (r replacer) setSize(coef int) {
 	if len(r) < 7 {
 		return
 	}
-	r[6] = byte(len(r) - 12)
+	r[6] = byte(len(r) - coef)
 	return
 }
 
@@ -292,7 +294,76 @@ func processTcUrlAndApp(b []byte) (changed bool, replaced []byte, err error) {
 	}
 	if ch {
 		_, replaced = replacer(b).trimLeadZeros()
-		replacer(replaced).setSize()
+		replacer(replaced).setSize(12)
+	}
+	return
+}
+
+func processReleaseStream(b []byte) (changed bool, replaced []byte, err error) {
+	if b[0] != byte(67) { // hex 43
+		return
+	}
+	var releaseStream string
+	var f []byte
+	var toReleaseStream = "pararam"
+	if b, f = replacer(b).searchAndReplace([]byte("releaseStream"), 13, nil, []byte(toReleaseStream)); f != nil {
+		releaseStream = string(f)
+		changed = true
+	}
+	if changed {
+		replaced = b
+		logrus.Printf("releaseStream: %s -> %s", releaseStream, toReleaseStream)
+	}
+
+	if changed {
+		_, replaced = replacer(b).trimLeadZeros()
+		replacer(replaced).setSize(8)
+	}
+	return
+}
+
+func processFCPublish(b []byte) (changed bool, replaced []byte, err error) {
+	if b[0] != byte(67) { // hex 43
+		return
+	}
+	var fcPublish string
+	var f []byte
+	var toFCPublish = "pararam"
+	if b, f = replacer(b).searchAndReplace([]byte("FCPublish"), 13, []byte{byte(67)}, []byte(toFCPublish)); f != nil {
+		fcPublish = string(f)
+		changed = true
+	}
+	if changed {
+		replaced = b
+		logrus.Printf("FCPublish: %s -> %s", fcPublish, toFCPublish)
+	}
+
+	if changed {
+		_, replaced = replacer(b).trimLeadZeros()
+		replacer(replaced).setSize(41)
+	}
+	return
+}
+
+func processPublish(b []byte) (changed bool, replaced []byte, err error) {
+	if b[0] != byte(4) { // hex 04
+		return
+	}
+	var publish string
+	var f []byte
+	var toPublish = "pararam"
+	if b, f = replacer(b).searchAndReplace([]byte("publish"), 13, []byte{byte(2)}, []byte(toPublish)); f != nil {
+		publish = string(f)
+		changed = true
+	}
+	if changed {
+		replaced = b
+		logrus.Printf("publish: %s -> %s", publish, toPublish)
+	}
+
+	if changed {
+		_, replaced = replacer(b).trimLeadZeros()
+		replacer(replaced).setSize(12)
 	}
 	return
 }
@@ -332,6 +403,9 @@ func processRawConnection(local net.Conn, connN int, target string) {
 			ack,
 		},
 		processTcUrlAndApp,
+		processReleaseStream,
+		processFCPublish,
+		processPublish,
 	)
 	go passThrough(&Channel{
 		remote,
