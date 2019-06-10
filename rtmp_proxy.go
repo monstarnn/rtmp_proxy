@@ -86,22 +86,22 @@ func passThrough(c *Channel, process ...func([]byte) (bool, []byte, error)) {
 			if len(process) > 0 {
 				var changed bool
 				for _, p := range process {
-					ch, chData, chErr := p(data)
+					ch, replaced, chErr := p(data)
 					if chErr != nil {
 						c.logger <- []byte(fmt.Sprintf("Process data error: %s\n", chErr.Error()))
 						break
 					}
 					if ch {
-						data = chData
+						data = replaced
 						changed = true
 					}
 				}
 				if changed {
-					c.logger <- []byte(fmt.Sprintf("Changes (processed) data\n"))
+					c.logger <- []byte(fmt.Sprintf("Changed (processed) data\n"))
 					c.logger <- []byte(hex.Dump(data))
 				}
 			}
-			c.binaryLogger <- b[:n]
+			c.binaryLogger <- data
 			c.to.Write(data)
 			c.logger <- []byte(fmt.Sprintf("Sent (#%d) to %s\n", packetN, toPeer))
 			offset += n
@@ -180,27 +180,121 @@ func passThroughRTMP(c *ChannelRTMP) {
 	//}
 }
 
-func processPacket(b []byte) (changed bool, ret []byte, err error) {
+type replacer []byte
 
-	var tcUrlIndex int
-	if tcUrlIndex = bytes.Index(b, []byte("tcUrl")); tcUrlIndex == -1 {
-		tcUrlIndex = bytes.Index(b, []byte("tcurl"))
-	}
-	if tcUrlIndex == -1 {
+func (r replacer) searchAndReplace(search []byte, stepAfterSearch int, stop, replaceTo []byte) (result, found []byte) {
+
+	var searchIndex int
+	if searchIndex = bytes.Index(r, search); searchIndex == -1 {
+		result = r
 		return
 	}
 
-	tcUrlIndex += 8
-	var tcUrlBytes = b[tcUrlIndex:]
-	if i := bytes.Index(tcUrlBytes, []byte{byte(0)}); i != -1 {
-		tcUrlBytes = tcUrlBytes[:i]
-	}
-	tcUrl := string(tcUrlBytes)
+	//logrus.Println(hex.Dump(r[3:7]))
+	//logrus.Println(binary.BigEndian.Uint32(r[3:7]), len(r)-12)
 
-	logrus.Println("tcUrl: ", tcUrl)
+	searchIndex += len(search) + stepAfterSearch
+	f := r[searchIndex:]
+	if foundEnd := bytes.Index(f, stop); foundEnd != -1 {
+		f = f[:foundEnd]
+	}
+
+	found = make([]byte, len(f))
+	copy(found, f)
+	//logrus.Println(hex.Dump(found))
+
+	result = make([]byte, searchIndex)
+	copy(result, r[:searchIndex])
+	result = append(result, replaceTo...)
+	result = append(result, r[searchIndex+len(found):]...)
+
+	// set size
+	result[searchIndex-1] = byte(len(replaceTo))
 
 	return
+}
 
+func (r replacer) trimLeadZeros() (trimmed bool, result []byte) {
+	for {
+		if len(r) <= 16 {
+			break
+		}
+		if searchIndex := bytes.Index(r, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}); searchIndex != 0 {
+			break
+		}
+		trimmed = true
+		r = r[16:]
+	}
+	result = r
+	return
+}
+
+func (r replacer) setSize() {
+	if len(r) < 7 {
+		return
+	}
+	r[6] = byte(len(r) - 12)
+	return
+}
+
+func processTcUrl(b []byte) (changed bool, replaced []byte, err error) {
+	var tcUrl string
+	var f []byte
+	var toTcUrl = "rtmp://localhost:9999/live"
+	if b, f = replacer(b).searchAndReplace([]byte("tcUrl"), 3, []byte{0}, []byte(toTcUrl)); f != nil {
+		tcUrl = string(f)
+		changed = true
+	}
+	if b, f = replacer(b).searchAndReplace([]byte("tcurl"), 3, []byte{0}, []byte(toTcUrl)); f != nil {
+		tcUrl = string(f)
+		changed = true
+	}
+	if changed {
+		replaced = b
+		logrus.Printf("tcUrl: %s -> %s", tcUrl, toTcUrl)
+	}
+	return
+}
+
+func processApp(b []byte) (changed bool, replaced []byte, err error) {
+
+	var app string
+	var f []byte
+	var toApp = "live"
+	if b, f = replacer(b).searchAndReplace([]byte("app"), 3, []byte{0}, []byte(toApp)); f != nil {
+		app = string(f)
+		changed = true
+	}
+	if changed {
+		replaced = b
+		logrus.Printf("app: %s -> %s", app, toApp)
+	}
+	return
+
+}
+
+func processTcUrlAndApp(b []byte) (changed bool, replaced []byte, err error) {
+	if b[0] != byte(3) {
+		return
+	}
+	var ch bool
+	if changed, replaced, err = processTcUrl(b); err != nil {
+		return
+	} else {
+		ch = true
+		b = replaced
+	}
+	if changed, replaced, err = processApp(b); err != nil {
+		return
+	} else {
+		ch = true
+		b = replaced
+	}
+	if ch {
+		_, replaced = replacer(b).trimLeadZeros()
+		replacer(replaced).setSize()
+	}
+	return
 }
 
 func processRawConnection(local net.Conn, connN int, target string) {
@@ -229,13 +323,16 @@ func processRawConnection(local net.Conn, connN int, target string) {
 	logger <- []byte(fmt.Sprintf("Connected to %s at %s\n", target,
 		formatTime(started)))
 
-	go passThrough(&Channel{
-		local,
-		remote,
-		logger,
-		loggerFrom,
-		ack,
-	}, processPacket)
+	go passThrough(
+		&Channel{
+			local,
+			remote,
+			logger,
+			loggerFrom,
+			ack,
+		},
+		processTcUrlAndApp,
+	)
 	go passThrough(&Channel{
 		remote,
 		local,
